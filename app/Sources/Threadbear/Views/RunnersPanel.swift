@@ -28,9 +28,15 @@ struct RunnersActivityButton: View {
 struct RunnersPanel: View {
     @Environment(AppModel.self) private var app
     @State private var aboutShown = false
+    /// The runners whose details are open, kept across launches.
+    @AppStorage("runnersPanelOpen") private var openIds = ""
+    /// Some Threadbear window can be seen: not hidden, minimised, covered,
+    /// or the screen locked or asleep.
+    @State private var onScreen = NSApp.occlusionState.contains(.visible)
 
     var body: some View {
         let runners = app.runners
+        let open = Set(openIds.split(separator: ",").map(String.init))
         let running = app.sections.running
         ScrollView {
             VStack(alignment: .leading, spacing: zoomed(14)) {
@@ -39,10 +45,11 @@ struct RunnersPanel: View {
                         .font(.system(size: zoomed(11), weight: .medium))
                         .foregroundStyle(.tertiary)
                     Spacer(minLength: 0)
-                    Button { app.loadRunners() } label: {
+                    Button { app.refreshRunners() } label: {
                         Image(systemName: "arrow.clockwise").font(.system(size: zoomed(11)))
                     }
                     .buttonStyle(.borderless)
+                    .busy(app.isBusy(BusyKey.refreshRunners))
                     .foregroundStyle(.secondary)
                     .tip("Check the runners again now")
                     Button { aboutShown.toggle() } label: {
@@ -53,8 +60,28 @@ struct RunnersPanel: View {
                     .tip("What this panel shows")
                     .popover(isPresented: $aboutShown, arrowEdge: .bottom) { RunnersAbout() }
                 }
-                ForEach(runners) { runner in
-                    RunnerCard(runner: runner, running: RunnersText.running(on: runner, in: running))
+                // In Mike's order, the phone's and Settings' too, and
+                // dragged into another here (Mike, 8 Nov).
+                let ordered = app.orderedRunners
+                let card = { (runner: RunnerInfo) in
+                    RunnerCard(runner: runner, running: RunnersText.running(on: runner, in: running),
+                               open: open.contains(runner.id), movable: app.canOrderRunners) {
+                        var next = open
+                        if next.contains(runner.id) { next.remove(runner.id) } else { next.insert(runner.id) }
+                        openIds = next.sorted().joined(separator: ",")
+                    }
+                }
+                if app.canOrderRunners {
+                    ReorderList(ids: ordered.map(\.id), style: .cards(spacing: zoomed(14)), preview: app.runnerPanelDragPreview,
+                                commit: { app.setRunnerOrder(part: $0) }) { id in
+                        if let runner = ordered.first(where: { $0.id == id }) {
+                            card(runner)
+                                .accessibilityAction(named: "Move up") { app.moveRunner(id, by: -1) }
+                                .accessibilityAction(named: "Move down") { app.moveRunner(id, by: 1) }
+                        }
+                    }
+                } else {
+                    ForEach(ordered) { card($0) }
                 }
             }
             .padding(zoomed(16))
@@ -66,6 +93,20 @@ struct RunnersPanel: View {
             while !Task.isCancelled {
                 app.loadRunners()
                 try? await Task.sleep(for: .seconds(30))
+            }
+        }
+        // The figures, only while some runner's details are open and
+        // Threadbear can be seen: asking has every runner report every
+        // 10 s, a write each in the backend, and the panel stays docked
+        // all day (the Convex I/O work, 5 Nov).
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeOcclusionStateNotification)) { _ in
+            onScreen = NSApp.occlusionState.contains(.visible)
+        }
+        .task(id: !open.isEmpty && onScreen) {
+            guard !open.isEmpty, onScreen else { return }
+            while !Task.isCancelled {
+                app.loadRunnerStats()
+                try? await Task.sleep(for: .seconds(10))
             }
         }
     }
@@ -80,6 +121,12 @@ private struct RunnerCard: View {
     @Environment(AppModel.self) private var app
     let runner: RunnerInfo
     let running: [ThreadSummary]
+    /// Its details (CPU, memory, disk) are showing.
+    let open: Bool
+    /// In a list that drags into Mike's order: a handle on the left, as in Settings.
+    var movable = false
+    let toggle: () -> Void
+    @State private var hovered = false
     /// Past this many the rest are a count: the panel is a glance, and
     /// the sidebar's Running section has them all.
     private static let shownThreads = 6
@@ -87,43 +134,32 @@ private struct RunnerCard: View {
     var body: some View {
         let state = RunnersText.state(runner)
         HStack(alignment: .top, spacing: zoomed(10)) {
+            if movable {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: zoomed(11)))
+                    .foregroundStyle(.tertiary)
+                    .frame(height: zoomed(17))
+                    .tip("Drag to change the order")
+                    .accessibilityHidden(true)
+            }
             Image(systemName: RunnerIcon.symbol(runner.icon))
                 .font(.system(size: zoomed(15)))
                 .foregroundStyle(state == .offline ? .tertiary : .secondary)
                 .frame(width: zoomed(22))
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: zoomed(3)) {
-                HStack(alignment: .firstTextBaseline, spacing: zoomed(5)) {
-                    Text(runner.name)
-                        .font(.system(size: zoomed(12), weight: .medium))
-                        .lineLimit(1)
-                    if isDefault {
-                        Image(systemName: "star.fill")
-                            .font(.system(size: zoomed(8)))
-                            .foregroundStyle(.tertiary)
-                            .tip("New threads start here")
-                            .accessibilityLabel("Default")
-                    }
-                    Spacer(minLength: zoomed(6))
-                    if let build = RunnersText.build(runner) {
-                        Text(build)
-                            .font(.system(size: zoomed(10), design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(1)
-                    }
-                }
-                HStack(alignment: .firstTextBaseline, spacing: zoomed(5)) {
-                    Circle()
-                        .fill(dotColor(state))
-                        .frame(width: zoomed(6), height: zoomed(6))
-                        .alignmentGuide(.firstTextBaseline) { $0[.bottom] - zoomed(1) }
-                        .accessibilityHidden(true)
-                    Text(RunnersText.stateLine(runner, now: app.now))
-                        .font(.system(size: zoomed(11)))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    // No count of its running threads here: they're listed
-                    // just below (one mark, one meaning).
+                // The name and state open the details (Mike, 5 Nov: "click
+                // on them to get more info about that specific runner").
+                Button(action: toggle) { header(state) }
+                    .buttonStyle(.plain)
+                    .onHover { hovered = $0 }
+                    .tip(open ? "Hide \(runner.name)'s details" : "Show \(runner.name)'s CPU, memory and disk")
+                    .accessibilityAddTraits(open ? [.isSelected] : [])
+                if open {
+                    RunnerDetails(runner: runner)
+                        .padding(.top, zoomed(5))
+                        .padding(.bottom, zoomed(2))
+                        .transition(.opacity)
                 }
                 if !paired {
                     Text("Not paired with this Mac")
@@ -148,9 +184,52 @@ private struct RunnerCard: View {
                 }
             }
         }
-        .contentShape(Rectangle())
-        .tip(RunnersText.rowTip(runner, now: app.now, running: running.count))
+        .animation(Juice.reduceMotion ? nil : .easeOut(duration: 0.15), value: open)
         .accessibilityElement(children: .contain)
+    }
+
+    /// The name, star, build and a chevron, then the state.
+    private func header(_ state: RunnersText.State) -> some View {
+        VStack(alignment: .leading, spacing: zoomed(3)) {
+            HStack(alignment: .firstTextBaseline, spacing: zoomed(5)) {
+                Text(runner.name)
+                    .font(.system(size: zoomed(12), weight: .medium))
+                    .lineLimit(1)
+                if isDefault {
+                    Image(systemName: "star.fill")
+                        .font(.system(size: zoomed(8)))
+                        .foregroundStyle(.tertiary)
+                        .accessibilityLabel("Default")
+                }
+                Spacer(minLength: zoomed(6))
+                if let build = RunnersText.build(runner) {
+                    Text(build)
+                        .font(.system(size: zoomed(10), design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.system(size: zoomed(9), weight: .semibold))
+                    .foregroundStyle(hovered ? .secondary : .tertiary)
+                    .rotationEffect(.degrees(open ? 90 : 0))
+                    .accessibilityHidden(true)
+            }
+            HStack(alignment: .firstTextBaseline, spacing: zoomed(5)) {
+                Circle()
+                    .fill(dotColor(state))
+                    .frame(width: zoomed(6), height: zoomed(6))
+                    .alignmentGuide(.firstTextBaseline) { $0[.bottom] - zoomed(1) }
+                    .accessibilityHidden(true)
+                Text(RunnersText.stateLine(runner, now: app.now))
+                    .font(.system(size: zoomed(11)))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                // No count of its running threads here: they're listed
+                // just below (one mark, one meaning).
+                Spacer(minLength: 0)
+            }
+        }
+        .contentShape(Rectangle())
     }
 
     private var isDefault: Bool {
@@ -169,6 +248,73 @@ private struct RunnerCard: View {
         case .updating: return .orange
         case .offline: return Color.secondary.opacity(0.35)
         }
+    }
+}
+
+/// A runner's CPU, memory and disk as bars, then what the machine is and
+/// how long it's been up. Orange only past the runner's own warning lines
+/// (90% memory, under 10 GB of disk; 90% CPU too).
+private struct RunnerDetails: View {
+    @Environment(AppModel.self) private var app
+    let runner: RunnerInfo
+
+    var body: some View {
+        if let s = app.runnerStats[runner.id] {
+            VStack(alignment: .leading, spacing: zoomed(5)) {
+                ForEach(RunnersText.gauges(s), id: \.title) { gauge in
+                    GaugeRow(gauge: gauge)
+                }
+                VStack(alignment: .leading, spacing: zoomed(1)) {
+                    ForEach(RunnersText.machineLines(s) + [RunnersText.staleLine(s, now: app.now)].compactMap { $0 }, id: \.self) { line in
+                        Text(line)
+                    }
+                }
+                .font(.system(size: zoomed(10.5)))
+                .foregroundStyle(.tertiary)
+                .lineLimit(2)
+                .padding(.top, zoomed(2))
+            }
+        } else {
+            Text(emptyLine)
+                .font(.system(size: zoomed(11)))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var emptyLine: String {
+        if RunnersText.state(runner) == .offline { return "Offline, so it isn't sending figures." }
+        return app.runnerStatsAsked ? "Waiting for its figures. An older runner doesn't send them." : "Asking for its figures…"
+    }
+}
+
+private struct GaugeRow: View {
+    let gauge: RunnersText.Gauge
+
+    var body: some View {
+        HStack(spacing: zoomed(8)) {
+            Text(gauge.title)
+                .font(.system(size: zoomed(11)))
+                .foregroundStyle(.secondary)
+                .frame(width: zoomed(48), alignment: .leading)
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.08))
+                    Capsule()
+                        .fill(gauge.high ? AnyShapeStyle(Color.orange) : AnyShapeStyle(Color.secondary.opacity(0.6)))
+                        .frame(width: max(zoomed(3), geo.size.width * gauge.fraction))
+                }
+            }
+            .frame(height: zoomed(5))
+            .animation(.easeOut(duration: 0.3), value: gauge.fraction)
+            Text(gauge.text)
+                .font(.system(size: zoomed(11)))
+                .monospacedDigit()
+                .foregroundStyle(gauge.high ? .primary : .secondary)
+                .lineLimit(1)
+                .frame(minWidth: zoomed(84), alignment: .trailing)
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 

@@ -71,8 +71,57 @@ export async function checkPhoneToken(ctx: QueryCtx | MutationCtx, token: string
   return { id: row._id, name: row.name, expiresAt: row.expiresAt };
 }
 
+// A page size a caller asked for, as a whole number from 1 to `max`. Convex's
+// v.number() lets NaN and the infinities through, and Math.min/max/floor keep
+// NaN, so a loop bounded by `out.length >= want` would never stop: anything
+// that isn't a finite number is refused rather than clamped.
+export function pageLimit(limit: number | undefined, fallback: number, max: number): number {
+  if (limit === undefined) return fallback;
+  if (!Number.isFinite(limit)) throw new ConvexError({ kind: 'invalid', message: 'limit must be a number' });
+  return Math.max(1, Math.min(max, Math.floor(limit)));
+}
+
 export async function sha256(text: string): Promise<string> {
   const data = new TextEncoder().encode(text);
   const digest = await crypto.subtle.digest('SHA-256', data);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Someone has a Runners view open: the website's (phone:watchRunners) or the
+// Mac app's runner details (sync:watchRunnersFromMac). Runners report their
+// figures until this lapses (API 45, 46). Each viewer renews it every 30 s
+// at most, so a closed view stops them within RUNNER_WATCH_MS.
+export const RUNNER_WATCH_MS = 45_000;
+export async function watchRunnersFor(ctx: MutationCtx): Promise<void> {
+  const until = Date.now() + RUNNER_WATCH_MS;
+  const row = await ctx.db.query('runnerWatch').first();
+  if (row) await ctx.db.patch(row._id, { until });
+  else await ctx.db.insert('runnerWatch', { until });
+}
+
+// Every runner's latest figures (runnerStats), `at` as an ISO string, for
+// phone:runnerStats and sync:runnerStatsList alike.
+export async function runnerStatsRows(ctx: QueryCtx) {
+  const out = [];
+  for await (const s of ctx.db.query('runnerStats')) {
+    const { _id, _creationTime, at, ...rest } = s;
+    out.push({ ...rest, at: new Date(at).toISOString() });
+  }
+  return out;
+}
+
+// Mike's runner order (the runnerOrder row, API 56): set from the phone's
+// Settings (phone:setRunnerOrder) or the Mac's (sync:setRunnerOrder, the
+// owner key only, API 58), one order for both. New threads that name no
+// runner start on the first one online in it (phone.ts mainRunner).
+export async function readRunnerOrder(ctx: QueryCtx): Promise<string[]> {
+  return (await ctx.db.query('runnerOrder').first())?.runnerIds ?? [];
+}
+
+export async function saveRunnerOrder(ctx: MutationCtx, runnerIds: string[]): Promise<void> {
+  if (runnerIds.length > 50 || runnerIds.some((id) => !id || id.length > 100)) throw new ConvexError({ kind: 'invalid', message: 'runnerIds must be at most 50 ids of 1 to 100 characters' });
+  const ids = [...new Set(runnerIds)];
+  const row = await ctx.db.query('runnerOrder').first();
+  if (row) await ctx.db.patch(row._id, { runnerIds: ids });
+  else await ctx.db.insert('runnerOrder', { runnerIds: ids });
 }
